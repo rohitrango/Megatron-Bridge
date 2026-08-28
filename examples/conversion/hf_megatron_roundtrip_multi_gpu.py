@@ -165,6 +165,7 @@ def main(
     skip_save: bool = False,
     atol: float = 1e-1,
     rtol: float = 1e-5,
+    gradient_accumulation_fusion: bool = True,
 ) -> None:
     """Perform round-trip conversion between HuggingFace and Megatron-LM models on multiple GPUs."""
     _configure_slurm_distributed_environment()
@@ -196,6 +197,7 @@ def main(
         model_provider.params_dtype = torch.bfloat16
         model_provider.expert_model_parallel_size = ep
         model_provider.expert_tensor_parallel_size = etp
+        model_provider.gradient_accumulation_fusion = gradient_accumulation_fusion
 
         # Once all overrides are set, finalize the model provider to ensure the post initialization logic is run
         model_provider.finalize()
@@ -222,6 +224,7 @@ def main(
         model_provider.params_dtype = torch.bfloat16
         model_provider.expert_model_parallel_size = ep
         model_provider.expert_tensor_parallel_size = etp
+        model_provider.gradient_accumulation_fusion = gradient_accumulation_fusion
 
         # Once all overrides are set, finalize the model provider to ensure the post initialization logic is run
         model_provider.finalize()
@@ -389,6 +392,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--atol", type=float, default=1e-1, help="Absolute tolerance for tensor comparison")
     parser.add_argument("--rtol", type=float, default=1e-5, help="Relative tolerance for tensor comparison")
+    parser.add_argument(
+        "--gradient-accumulation-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep MCore's gradient accumulation fusion enabled (default). Pass "
+            "--no-gradient-accumulation-fusion in environments without APEX's "
+            "fused_weight_gradient_mlp_cuda extension; the fusion is training-only and "
+            "does not affect conversion."
+        ),
+    )
     return parser
 
 
@@ -409,6 +423,7 @@ if __name__ == "__main__":
         skip_save=args.skip_save,
         atol=args.atol,
         rtol=args.rtol,
+        gradient_accumulation_fusion=args.gradient_accumulation_fusion,
     )
 
     if torch.distributed.is_initialized():
