@@ -83,8 +83,22 @@ def _copy_mapping_with_prefixes(mapping, *, megatron_prefix: str, hf_prefix: str
     provider=NemotronOmniModelProvider,
     model_type="NemotronH_Super_Omni_Reasoning_V3",
 )
+# Nemotron-3.5 Super vision. Registered last in the decorator stack (applied first) so
+# SOURCE_NAME/MODEL_TYPE, which megatron_to_hf_config writes into the exported
+# config.json, keep pointing at the Nano architecture for existing checkpoints.
+@MegatronModelBridge.register_bridge(
+    source="NemotronH_Omni_Reasoning_V3",
+    target=NemotronOmniModel,
+    provider=NemotronOmniModelProvider,
+    model_type="nemotron_h_omni",
+)
 class NemotronOmniBridge(NemotronVLBridge):
     """Bridge for the canonical expanded-sequence Nemotron-3 Omni model."""
+
+    # Historical Super Omni checkpoints keep the MTP block at the top level; every other
+    # Omni layout nests it under `language_model.` with the rest of NemotronH. Nano Omni
+    # has no MTP at all, so this only ever selects between the two MTP-bearing layouts.
+    _TOP_LEVEL_MTP_ARCHITECTURES = ("NemotronH_Super_Omni_Reasoning_V3",)
 
     _HF_PASSTHROUGH_KEYS = (
         "sound_encoder.encoder.feature_extractor.featurizer.fb",
@@ -118,6 +132,7 @@ class NemotronOmniBridge(NemotronVLBridge):
         "video_io.py",
         "audio_model.py",
         "evs.py",
+        "*reasoning_parser.py",
     ]
 
     # ------------------------------------------------------------------
@@ -171,15 +186,30 @@ class NemotronOmniBridge(NemotronVLBridge):
         provider_kwargs["activation_func"] = squared_relu
 
         # Temporal video embedder: pull settings from HF vision_config when the
-        # checkpoint was trained with a separate video patch embedder.
+        # checkpoint was trained with a separate video patch embedder. Older configs
+        # carry the explicit `separate_video_embedder` flag; the transformers-5.8
+        # RadioConfig dropped it and, like the HF modeling code, builds the video
+        # patch projection whenever a temporal patch size is set.
         vision_cfg = getattr(hf_config, "vision_config", None)
-        if vision_cfg is not None and getattr(vision_cfg, "separate_video_embedder", False):
+        temporal_patch_size = getattr(vision_cfg, "video_temporal_patch_size", None) or 0
+        has_video_embedder = getattr(vision_cfg, "separate_video_embedder", False) or temporal_patch_size > 1
+        if vision_cfg is not None and has_video_embedder:
             provider_kwargs["separate_video_embedder"] = True
-            provider_kwargs["temporal_patch_dim"] = getattr(vision_cfg, "video_temporal_patch_size", 2)
+            provider_kwargs["temporal_patch_dim"] = temporal_patch_size or 2
             provider_kwargs["temporal_ckpt_compat"] = True
 
+        # MTP: reuse NemotronHBridge's normalization so the hybrid MTP block is built
+        # the same way for the plain LLM and for the Omni composition.
+        mtp_num_layers, mtp_pattern = NemotronHBridge._hf_mtp_config(llm_config)
+        # The vision tower's final LayerNorm only exists in MTP-bearing checkpoints.
+        provider_kwargs["vision_final_layernorm"] = mtp_num_layers > 0
+
         provider = NemotronOmniModelProvider(**provider_kwargs)
-        provider.mtp_hybrid_override_pattern = getattr(llm_config, "mtp_hybrid_override_pattern", None)
+        provider.mtp_hybrid_override_pattern = mtp_pattern
+        if mtp_num_layers:
+            provider.mtp_use_repeated_layer = bool(getattr(llm_config, "mtp_use_repeated_layer", True))
+            provider.keep_mtp_spec_in_bf16 = bool(getattr(llm_config, "keep_mtp_spec_in_bf16", True))
+            provider.mtp_loss_scaling_factor = getattr(llm_config, "mtp_loss_scaling_factor", 0.3)
         return provider
 
     @classmethod
@@ -271,6 +301,9 @@ class NemotronOmniBridge(NemotronVLBridge):
         hf_config = getattr(self, "hf_config", None)
         llm_config = getattr(hf_config, "llm_config", None)
 
+        architectures = getattr(hf_config, "architectures", None) or []
+        mtp_hf_prefix = "" if any(a in self._TOP_LEVEL_MTP_ARCHITECTURES for a in architectures) else "language_model."
+
         language_bridge = NemotronHBridge()
         language_bridge.hf_config = llm_config
         for mapping in language_bridge.mapping_registry().mappings:
@@ -279,11 +312,20 @@ class NemotronOmniBridge(NemotronVLBridge):
                 _copy_mapping_with_prefixes(
                     mapping,
                     megatron_prefix="language_model.",
-                    # The public Omni checkpoint keeps MTP at the top level,
-                    # while the rest of NemotronH lives under language_model.
-                    hf_prefix="" if is_mtp else "language_model.",
+                    hf_prefix=mtp_hf_prefix if is_mtp else "language_model.",
                 )
             )
+
+        # MTP-bearing checkpoints carry the vision tower's block-final LayerNorm, which
+        # the HF model exposes on the projector as `vision_final_layernorm`.
+        if NemotronHBridge._hf_mtp_config(llm_config)[0] > 0:
+            for suffix in ("weight", "bias"):
+                mappings.append(
+                    AutoMapping(
+                        megatron_param=f"vision_model.decoder.final_layernorm.{suffix}",
+                        hf_param=f"vision_projector.vision_final_layernorm.{suffix}",
+                    )
+                )
 
         return MegatronMappingRegistry(*mappings)
 

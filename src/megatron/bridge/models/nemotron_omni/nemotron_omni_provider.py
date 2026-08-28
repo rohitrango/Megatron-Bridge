@@ -173,6 +173,14 @@ class _NemotronOmniModelProviderBase(NemotronVLModelProvider):
     separate_video_embedder: bool = False
     temporal_ckpt_compat: bool = False  # formerly allow_checkpoint_without_temporal_compression
 
+    # MTP-bearing Omni checkpoints (Nemotron-3.5 Super vision) were trained with the
+    # language model's MTP settings visible to the vision tower, so MCore's
+    # TransformerBlock.has_final_layernorm_in_this_stage() placed a final LayerNorm at
+    # the end of the RADIO stack. That LayerNorm carries trained weights, so it has to
+    # be rebuilt on load. The vision config's mtp_num_layers is the only lever for it:
+    # RADIOViTModel hardcodes post_process=False on its TransformerBlock.
+    vision_final_layernorm: bool = False
+
     # This field is serialized in run_config.yaml. It prevents an older
     # checkpoint whose provider had the same class name but LLaVA semantics
     # from being loaded as the canonical expanded-sequence implementation.
@@ -193,6 +201,12 @@ class _NemotronOmniModelProviderBase(NemotronVLModelProvider):
             )
         if self.has_sound and self.sound_config is None:
             raise ValueError("Sound-enabled Nemotron Omni requires sound_config from the checkpoint configuration.")
+        if self.vision_final_layernorm and not self.mtp_num_layers:
+            raise ValueError(
+                "vision_final_layernorm=True requires mtp_num_layers > 0: the vision tower's final "
+                "LayerNorm is only built when the (shared) config carries the language model's MTP "
+                f"depth. Got mtp_num_layers={self.mtp_num_layers}."
+            )
 
     def finalize(self) -> None:
         """Finalize a dynamic-resolution Nemotron Omni provider."""
@@ -231,6 +245,10 @@ class _NemotronOmniModelProviderBase(NemotronVLModelProvider):
         """
         vision_cfg = super()._build_vision_config(language_cfg)
         vision_cfg.pipeline_model_parallel_size = 1
+        if self.vision_final_layernorm:
+            # Undo the base provider's blanket reset so TransformerBlock takes its
+            # MTP branch and attaches a final LayerNorm to the last RADIO layer.
+            vision_cfg.mtp_num_layers = self.mtp_num_layers
         return vision_cfg
 
     def _build_vision_projection_config(self, language_cfg):
