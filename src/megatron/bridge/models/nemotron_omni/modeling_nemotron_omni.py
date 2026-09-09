@@ -33,6 +33,10 @@ from typing import Optional, Union
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.multimodal.context_parallel import (
+    gather_from_context_parallel_ranks_dynamic_res,
+    split_to_context_parallel_ranks_dynamic_res,
+)
 from megatron.core.models.multimodal.llava_model import pixel_shuffle
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
@@ -383,6 +387,7 @@ class NemotronOmniModel(MegatronModule):
         else:
             images = images.to(dtype=parameter.dtype)
 
+        num_padded_ranks = 0
         if imgs_sizes is not None and imgs_sizes.numel() > 0:
             images = self._patchify_dynamic_images(images, imgs_sizes)
             if vision_packed_seq_params is None:
@@ -393,6 +398,32 @@ class NemotronOmniModel(MegatronModule):
                     "num_frames is required by the configured RADIO encoder; "
                     "provide one entry per image or video item."
                 )
+
+            if self.context_parallel_lm > 1:
+                (
+                    images,
+                    imgs_sizes,
+                    vision_packed_seq_params,
+                    _,
+                    num_padded_ranks,
+                    local_num_frames,
+                ) = split_to_context_parallel_ranks_dynamic_res(
+                    images,
+                    imgs_sizes,
+                    vision_packed_seq_params,
+                    patch_dim=self.patch_dim,
+                    num_frames=num_frames,
+                    temporal_patch_size=getattr(self.vision_model, "temporal_patch_dim", 1),
+                )
+                if local_num_frames is not None:
+                    num_frames = local_num_frames
+                if (
+                    num_padded_ranks > 0
+                    and self.pg_collection.cp.rank() >= self.context_parallel_lm - num_padded_ranks
+                ):
+                    images = images.repeat_interleave(4, dim=1)
+                    imgs_sizes = imgs_sizes * 2
+                    vision_packed_seq_params = _build_vision_packed_seq_params(imgs_sizes, self.patch_dim)
 
             vision_output = self.vision_model(
                 images,
@@ -431,6 +462,8 @@ class NemotronOmniModel(MegatronModule):
             encoded = pixel_shuffle(encoded).reshape(-1, encoded.shape[-1] * 4)
 
         projected = self.vision_projection(encoded.unsqueeze(1))
+        if self.context_parallel_lm > 1 and imgs_sizes is not None and imgs_sizes.numel() > 0:
+            projected = gather_from_context_parallel_ranks_dynamic_res(projected, num_padded_ranks)
         return projected.squeeze(1).contiguous()
 
     def _encode_sound(self, sound_clips: torch.Tensor, sound_length: Optional[torch.Tensor]) -> torch.Tensor:
